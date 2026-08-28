@@ -69,7 +69,9 @@ disk. If asked to start Phase 2, confirm the VM has actually been resized first.
    Mounting `docker.sock` into a containerised client "works" but silently breaks cgroup
    isolation, bridge networking and CNI — don't quietly adopt it.
 2. **Every Nomad node needs its own local Consul agent** at `127.0.0.1:8500`. Sharing one
-   Consul endpoint across Nomad agents is explicitly forbidden. See ADR-002.
+   Consul endpoint across Nomad agents is explicitly forbidden. See ADR-002. Under the
+   accepted topology that local agent *is* the VM's Consul server — one agent per VM, not
+   a server plus a client agent, which would collide on 8500/8301/8600.
 3. **Doris is not stateless.** FE/BE persist their own network identity; BEs register with
    the FE by address. Rescheduling onto a different address corrupts membership. Doris
    ports must also be static, not from Nomad's dynamic range. See ADR-005.
@@ -80,6 +82,13 @@ disk. If asked to start Phase 2, confirm the VM has actually been resized first.
 6. **Nomad 2.0.4+ enforces `allowed_modes` / `allow_privileged`** (CVE-2026-14891) before a
    task may set host namespace modes. If a Doris job needs `network_mode = "host"`, the
    client's `plugin "docker"` block must permit it.
+7. **The target is 3 VMs, not one.** Everything must advertise the VM's routable IP
+   (Consul `advertise_addr`, Nomad `advertise {}`) and expose its ports on the host —
+   never a Docker bridge address. The cluster is one symmetric node stack per VM; scaling
+   out is `bootstrap_expect` 1→3 plus `retry_join`, and nothing else. See ADR-008.
+8. **Scale-in is a procedure, not a `down`.** Drain a Doris BE with
+   `ALTER SYSTEM DECOMMISSION BACKEND` before removing its host, and let a departing
+   Consul/Nomad server leave Raft gracefully. See ADR-008.
 
 ## Conventions
 
@@ -94,7 +103,14 @@ disk. If asked to start Phase 2, confirm the VM has actually been resized first.
 
 ## Current status
 
-Phase 0 (research) is complete. Phase 1 is planned but **not yet built** — no
-`compose.yaml` or configs exist yet. Open questions blocking further work are listed at
-the end of `docs/plan.md`; the immediate one is whether Phase 1 should enable ACLs and
-gossip encryption (recommendation: no, defer to a hardening pass).
+Phase 0 (research) is complete. Phase 1 is **designed and unblocked but not yet built** —
+no `compose.yaml` or configs exist yet.
+
+Two decisions were settled on 2026-08-28:
+- **ADR-008** — the multi-VM target is accepted, option A: one symmetric node stack per
+  VM (Consul server + Nomad server in Compose on host networking, Nomad client native).
+  ADR-003's 3+3-on-one-host shape is superseded.
+- **ADR-009** — no ACLs or gossip encryption in Phase 1; deferred to a hardening pass.
+
+Still open: ADR-004 (Doris version) and ADR-005 (identity under a scheduler — now urgent,
+since it must be settled before a second Nomad client joins).

@@ -80,16 +80,26 @@ Nomad's `consul` block also defaults to `address = "127.0.0.1:8500"`, i.e. a loc
 is the assumed topology.
 
 **Decision.** Every Nomad node gets a Consul agent reachable at `127.0.0.1:8500`.
-- Containerised Nomad servers: a Consul client agent container sharing the Nomad
-  container's network namespace (`network_mode: "service:<nomad-server>"`), so
-  `127.0.0.1:8500` resolves correctly.
-- Native Nomad client: a native Consul client agent under systemd.
+
+**As built under ADR-008 option A:** each VM runs a single Consul agent — the Consul
+server container on the host network namespace — and both the Nomad server and the native
+Nomad client on that VM reach it at `127.0.0.1:8500`. The requirement "a local Consul
+agent on the same host" is met; the caveat that this agent is a server rather than a
+client is flagged in ADR-008 and is not explicitly addressed by the documentation.
+
+*Original per-role plan, retained for the record and applicable if client-only VMs are
+added later:* a Consul client agent container sharing the Nomad server container's network
+namespace (`network_mode: "service:<nomad-server>"`), and a native Consul client agent
+under systemd alongside a native Nomad client.
 
 ---
 
 ## ADR-003 — Cluster shape: 3 Consul servers, 3 Nomad servers, 1 Nomad client
 
-**Status:** Accepted for Phase 1; client count revisited in Phase 2
+**Status:** **Superseded by ADR-008.** The 3+3-on-one-host shape does not survive the
+multi-VM target. The cluster is now one Consul server + one Nomad server + one Nomad
+client *per VM*: today a single node, and a real three-node quorum once the VMs exist.
+The reasoning below still stands on its own terms — it simply assumed one host.
 
 Three servers each give a real Raft quorum (HashiCorp recommends 3–5 per region, odd
 numbers) and let us demonstrate leader election and failure tolerance, which a single
@@ -123,7 +133,9 @@ line. Not decided yet.
 
 ## ADR-005 — Doris identity under a scheduler (deferred, Phase 2)
 
-**Status:** Open — flagged early because it shapes the job specs
+**Status:** Open — and promoted in urgency by ADR-008: this must be resolved before a
+second Nomad client joins, not merely before Phase 2. With one client it is masked; with
+several it is the first thing to break.
 
 Doris is not a stateless workload. FE and BE persist their own network identity into
 metadata, and BEs are registered with the FE by address. Under a scheduler that can
@@ -141,7 +153,8 @@ Options to evaluate in Phase 2 (all require verification against the official do
 
 Additionally, CCR needs BE↔BE reachability across *both* clusters (downstream BEs pull
 snapshots from upstream BEs over `webserver_port` 8040), so the two clusters cannot be
-isolated on separate networks.
+isolated on separate networks. On a multi-VM cluster that is inter-VM traffic requiring
+firewall/VPC rules, not merely a shared Docker network — see ADR-008.
 
 ---
 
@@ -172,3 +185,117 @@ promotion is an operational procedure.
 
 The POC should therefore measure **replication lag** (the syncer's `get_lag` endpoint)
 rather than assume zero-RPO behaviour.
+
+---
+
+## ADR-008 — Multi-VM target: build Phase 1 so it scales out without a rewrite
+
+**Status:** Accepted (2026-08-28) — **option A**, the symmetric node stack, with the
+one-agent-per-VM correction recorded below.
+
+**Context.** The POC will not stay on one VM. The stated intent is that this host scales
+in and out as needed, likely to **3 VMs forming one Nomad cluster**, with the two Doris
+clusters and `ccr-syncer` scheduled across it.
+
+That invalidates an assumption baked into the Phase 1 design: that every process shares a
+single host, so Docker bridge networking and default advertise addresses are sufficient.
+Across VMs they are not. Three things break the moment a second VM joins:
+
+1. **Advertise addresses.** A Consul or Nomad agent that advertises its Docker bridge IP
+   (`172.x`) is unreachable from another VM. Both products must advertise the VM's
+   routable address — Consul `advertise_addr`, Nomad `advertise { http, rpc, serf }`.
+   This costs nothing on one VM and is the difference between working and not on three.
+2. **Port exposure.** Consul 8300/8301/8302/8500/8600 and Nomad 4646/4647/4648 must be
+   reachable on the host address, not just inside a Compose network — plus the firewall
+   or VPC rules to match. See the port tables in [`research.md`](./research.md) §4.
+3. **Three servers on one host cannot all use standard ports.** ADR-003's shape (3 Consul
+   servers + 3 Nomad servers on this VM) only works today because they are on a bridge
+   with private IPs. Exposing them on one host means per-server port shifting or host IP
+   aliases — carried as permanent complexity for a quorum that is fake anyway: three Raft
+   peers in one kernel on one disk tolerate no real failure.
+
+**Options.**
+
+- **A — Symmetric node stack, grown in place.** Each VM runs an identical stack: one
+  Consul server, one Nomad server, one native Consul agent, one native Nomad client, all
+  on host-routable addresses with standard ports. Today `bootstrap_expect = 1` and an
+  empty `retry_join`; at three VMs, `bootstrap_expect = 3` and the peer list filled in.
+  Nothing else changes — same files, same ports, no port math. Cost: no leader-election
+  demonstration until the other VMs exist.
+- **B — Central control plane, client-only workers.** Keep ADR-003's 3+3 control plane on
+  this VM and join VMs 2 and 3 as pure Nomad clients via `install-client.sh`. Preserves
+  the quorum demonstration and the existing design; costs the per-server port or IP
+  juggling from (3) now, and leaves VM1 a control-plane single point of failure.
+- **C — Build Phase 1 as designed and rework at scale-out.** Cheapest today, and the
+  rework is not small: networking model, config layout, and bring-up all change.
+
+**Decision: A.** The POC's subject is Doris and CCR, not Consul Raft; a symmetric stack
+that grows by editing two values is worth more than a leader election on a single failure
+domain. B is defensible if the quorum behaviour is itself something you want to watch.
+
+**Correction to the shape as first written: one Consul agent per VM, and it is the
+server.** The option was initially described as a Consul *server* plus a separate native
+Consul *client* agent on each VM. That cannot work: with the server on the host network
+namespace, both agents contend for 8500, 8301 and 8600 on the same host. Under A each VM
+therefore runs exactly **one** Consul agent — the server — and the native Nomad client
+points at it via the default `127.0.0.1:8500`. `config/consul/agent.hcl` is consequently
+not part of Phase 1; it returns only if client-only VMs are ever added beyond the three
+server nodes.
+
+**Per-VM stack, final:**
+
+| Process | How it runs |
+|---|---|
+| Consul server (also the node's local agent) | Compose, `network_mode: host` |
+| Nomad server | Compose, `network_mode: host` |
+| Nomad client | Native, systemd, root (ADR-001) |
+
+Scaling to 3 VMs: same files on each, `bootstrap_expect` 1 → 3, `retry_join` gains the
+peer addresses.
+
+**Note on co-location (unverified interpretation, not doc-backed).** Under A — as
+corrected above — a VM's Nomad client uses the Consul agent that is also a Consul
+*server*. ADR-002 quotes
+"Nomad clients should never share a Consul agent or talk directly to the Consul servers";
+read in context that is about pointing a client at a *remote* agent, and a co-located
+server agent still satisfies "a local Consul agent on the same host". This reading is
+not stated explicitly in the documentation and should be confirmed before relying on it.
+
+**Consequences beyond Phase 1.**
+
+- **ADR-005 stops being theoretical.** With one Nomad client, a rescheduled Doris
+  allocation always lands back on the same address, so identity is stable by accident.
+  With three clients it is not, and a naive job spec will corrupt cluster membership on
+  the first reschedule. Pinning, host volumes and FQDN mode must be resolved *before*
+  the second client joins, not merely before Phase 2.
+- **Doris port collisions disappear.** Pinned one Doris cluster per VM, cluster A and
+  cluster B can both use the documented default ports instead of an offset scheme for B.
+  This only holds if the pinning in ADR-005 is real.
+- **CCR's BE↔BE requirement becomes a cross-VM firewall concern.** Downstream BEs pull
+  snapshots from upstream BEs over 8040/8060; that is now inter-VM traffic and needs
+  explicit VPC or firewall rules, not just a shared Docker network.
+- **FQDN mode gets more attractive.** One FE per VM under `network_mode = "host"` means
+  the VM hostname is a stable identity, which is exactly what Doris FQDN mode wants.
+
+**Scale-in is not symmetric with scale-out.** Removing a VM is a procedure, not a
+`docker compose down`:
+- A Doris BE must be drained with `ALTER SYSTEM DECOMMISSION BACKEND` and confirmed empty
+  before its host goes away; killing it loses replicas.
+- A departing Nomad or Consul *server* must leave Raft gracefully; a hard kill leaves a
+  dead peer and can cost quorum. Only the **client tier** is safe to scale casually —
+  which is another argument for A, where the server tier is deliberately small and fixed.
+
+---
+
+## ADR-009 — No ACLs or gossip encryption in Phase 1
+
+**Status:** Accepted (2026-08-28)
+
+Phase 1 runs Consul and Nomad unsecured: no ACL bootstrap, no gossip encryption key, no
+mTLS. Enabling them roughly doubles bring-up complexity and puts token distribution into
+every job spec and helper script, in front of the work the POC actually exists to prove.
+
+**Consequence.** The cluster must not be exposed beyond the VMs' private network, and
+nothing here is a template for a real deployment. Security is a later hardening pass over
+a working POC, and that pass should cover Consul ACLs, gossip encryption, Nomad ACLs, and
+the Doris sync account's privileges together rather than piecemeal.

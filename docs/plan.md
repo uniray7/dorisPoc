@@ -30,40 +30,52 @@ Also worth knowing early:
    FE+BE images alone are ~4.4 GB compressed (~8–10 GB unpacked), and Doris's own
    *dev/test minimum* is 8 cores + 8 GB for FE and 8 cores + 16 GB for BE — per cluster.
    Phase 1 fits comfortably; Phases 2–4 need a bigger machine.
-4. **Official Doris CCR docs stop at 2.1.** No CCR documentation exists for 3.x or 4.x.
+4. **The target is not one VM.** This host will scale in and out, likely to **3 VMs in
+   one Nomad cluster**, with both Doris clusters and the syncer scheduled across them.
+   Phase 1 must therefore be built with host-routable advertise addresses and exposed
+   ports from the start, or scaling out is a rewrite. → ADR-008
+5. **Official Doris CCR docs stop at 2.1.** No CCR documentation exists for 3.x or 4.x.
    CCR still works there, but expect to read 2.1 docs while running 3.0. → ADR-004
 
 ---
 
-## Target architecture (Phase 1)
+## Target architecture (ADR-008 option A)
+
+One **node stack**, replicated per VM. Today there is one VM; the same files run on three.
 
 ```
-                       host: this VM
-  ┌──────────────────────── docker compose ────────────────────────┐
-  │                                                                │
-  │  consul-server-1 ─┐                                            │
-  │  consul-server-2 ─┼── Raft quorum (bootstrap_expect = 3)       │
-  │  consul-server-3 ─┘                                            │
-  │                                                                │
-  │  nomad-server-1 + consul-agent-1  (shared netns)  ─┐           │
-  │  nomad-server-2 + consul-agent-2  (shared netns)  ─┼─ Raft     │
-  │  nomad-server-3 + consul-agent-3  (shared netns)  ─┘           │
-  │                                                                │
-  └────────────────────────────────────────────────────────────────┘
-                              ▲
-                              │ 4647 RPC
-   ┌──────────────────────────┴──────────── native, systemd, root ─┐
-   │  nomad client agent  ──local 127.0.0.1:8500──▶  consul agent  │
-   │        │                                                      │
-   │        └── docker driver ──▶ host Docker daemon               │
-   └───────────────────────────────────────────────────────────────┘
+  ┌───────────────────────────── VM (× 1 today, × 3 later) ─────────────────────────────┐
+  │                                                                                     │
+  │  ┌──────────── docker compose ────────────┐                                         │
+  │  │  consul-server   network_mode: host    │  advertise = VM's routable IP           │
+  │  │  nomad-server    network_mode: host    │  8300/8301/8302/8500/8600, 4646/47/48   │
+  │  └────────────────────────────────────────┘                                         │
+  │             ▲                    ▲                                                  │
+  │             │ 127.0.0.1:8500     │ 4647 RPC                                         │
+  │  ┌──────────┴────────────────────┴──────── native, systemd, root ────────────────┐  │
+  │  │  nomad client  ── docker driver ──▶  host Docker daemon                       │  │
+  │  └───────────────────────────────────────────────────────────────────────────────┘  │
+  └─────────────────────────────────────────────────────────────────────────────────────┘
+
+  1 VM:   bootstrap_expect = 1,  retry_join = []
+  3 VMs:  bootstrap_expect = 3,  retry_join = [vm1, vm2, vm3]        ← the only diff
 ```
 
-Each Nomad server container has a Consul client agent sharing its network namespace, so
-Nomad's default `consul { address = "127.0.0.1:8500" }` is correct without override.
+**One Consul agent per VM, and it is the server.** With the Consul server on the host
+network namespace there is no room for a second agent on 8500/8301/8600, so the Nomad
+server and the native Nomad client both use it via the default
+`consul { address = "127.0.0.1:8500" }`. ADR-002 is satisfied — the agent is local — with
+the caveat noted in ADR-008 that it is a server rather than a client agent.
+
+**Everything advertises the VM's routable IP**, driven by one environment variable per
+VM. Never a `172.x` bridge address: that is the single thing which, if got wrong now,
+turns scale-out into a rewrite.
 
 **Versions:** Nomad 2.0.5, Consul 2.0.3 (both current OSS; Nomad 2.0.0 introduced no
 config-breaking changes for the blocks we use).
+
+**Security:** none in Phase 1 — no ACLs, no gossip encryption, no mTLS (ADR-009). Keep the
+cluster on a private network.
 
 ---
 
@@ -73,36 +85,51 @@ config-breaking changes for the blocks we use).
 
 | Path | Purpose |
 |---|---|
-| `compose.yaml` | 3 Consul servers, 3 Nomad servers, 3 Consul agent sidecars |
-| `config/consul/server.hcl` | Consul server config |
-| `config/consul/agent.hcl` | Consul client agent config |
+| `compose.yaml` | One Consul server + one Nomad server, both `network_mode: host` — identical on every VM |
+| `.env.example` | Per-VM values: `ADVERTISE_IP`, `BOOTSTRAP_EXPECT`, `RETRY_JOIN`, `NODE_NAME` |
+| `config/consul/server.hcl` | Consul server config (also this node's local agent) |
 | `config/nomad/server.hcl` | Nomad server config |
 | `config/nomad/client.hcl` | Nomad client config (used natively) |
-| `scripts/install-client.sh` | Installs Nomad + Consul from the official apt repo, writes systemd units, starts the native client |
-| `scripts/verify.sh` | Asserts cluster health |
+| `scripts/install-client.sh` | Installs Nomad from the official apt repo, writes the systemd unit, starts the native client — takes the server addresses as arguments so it is unchanged on VM 2 and VM 3 |
+| `scripts/verify.sh` | Asserts cluster health, including that no agent advertises a bridge address |
 | `Makefile` | `make up`, `make down`, `make verify`, `make status` |
 
+No `config/consul/agent.hcl`: every VM in this topology runs a Consul *server*, so there
+is no client-only agent to configure (ADR-008).
+
 **Steps**
-1. Write Consul server config and bring up the 3-server Consul cluster; confirm a leader.
-2. Add the Nomad servers plus their Consul agent sidecars; confirm Nomad Raft quorum.
-3. Install Nomad + Consul natively via the HashiCorp apt repo; configure the client to
-   join the servers; enable the docker driver with the `allowed_modes` / `volumes`
-   settings that Doris will later need (CVE-2026-14891 makes these mandatory for host
-   namespace modes).
+1. Write the Consul server config and bring it up with `bootstrap_expect = 1`, on the
+   host network namespace, advertising the VM's routable IP; confirm a leader.
+2. Add the Nomad server, same networking, pointing at `127.0.0.1:8500`; confirm it is
+   leader and registered in Consul.
+3. Install Nomad natively via the HashiCorp apt repo; configure the client to join the
+   server and to use the local Consul agent; enable the docker driver with the
+   `allowed_modes` / `volumes` settings that Doris will later need (CVE-2026-14891 makes
+   these mandatory for host namespace modes).
 4. Run a throwaway job (a small container with a `service` block) to prove scheduling and
    Consul registration end-to-end.
 
-**Exit criteria**
-- `consul members` → 3 servers alive + 1 agent per Nomad node
+**Multi-VM readiness, to build in now rather than retrofit (ADR-008)**
+- Every agent advertises the VM's routable IP — Consul `advertise_addr`, Nomad
+  `advertise { http, rpc, serf }` — sourced from one env var per VM, never a bridge IP.
+- Consul 8300/8301/8302/8500/8600 and Nomad 4646/4647/4648 bound on the host address.
+- `retry_join` as an address list driven by config, so adding a VM is a list edit.
+- `scripts/install-client.sh` takes the server addresses as arguments, so the same script
+  provisions VM 2 and VM 3 unchanged.
+
+**Exit criteria** *(counts are per current VM count — 1 today, 3 after scale-out)*
+- `consul members` → one agent per VM, all alive
 - `consul operator raft list-peers` → leader elected
-- `nomad server members` → 3 alive, leader elected
-- `nomad node status` → 1 ready client, docker driver healthy
+- `nomad server members` → one per VM, leader elected
+- `nomad node status` → one ready client per VM, docker driver healthy
 - Test job runs, and its service appears in the Consul catalog with a passing health check
 - Consul UI on :8500 and Nomad UI on :4646 reachable
+- Every agent's advertised address is the host's routable IP, not a `172.x` bridge address
+  — checked with `consul members` and `nomad node status -verbose`
 
-**Open question for you:** do you want ACLs and gossip encryption enabled in Phase 1?
-Recommendation: **no** — it roughly doubles the bring-up complexity and adds token
-plumbing that gets in the way of the Doris work. Better added in a later hardening pass.
+**Scale-out check (when VM 2 and VM 3 exist):** set `BOOTSTRAP_EXPECT=3` and fill
+`RETRY_JOIN`, copy the same tree to each VM, `make up`, run `install-client.sh` — and
+expect no other edits. If that is not true, ADR-008 was not honoured somewhere.
 
 ---
 
@@ -112,15 +139,28 @@ Not designed in detail yet — deliberately, since ADR-004 (version) and ADR-005
 under a scheduler) are still open and the answers change the job specs.
 
 **Prerequisites**
-- A host of roughly **8 vCPU / 32 GB RAM / 200 GB disk**. Rationale: Doris's documented
-  dev/test minimum is 8 cores + 8 GB (FE) and 8 cores + 16 GB (BE) *per cluster*; CCR
-  additionally wants **≥ 4 GB FE heap per CCR job on both clusters**. 16 GB would be tight
-  to the point of being misleading; 32 GB leaves room for the control plane and ingestion.
-- Host tuning Doris requires: `vm.max_map_count = 2000000` (this VM is at 1048576), swap
-  off (already true), THP `madvise`, raised file-handle limits, NTP.
+
+Doris's documented dev/test minimum is 8 cores + 8 GB (FE) and 8 cores + 16 GB (BE) *per
+cluster*, and CCR additionally wants **≥ 4 GB FE heap per CCR job on both clusters**.
+Two ways to meet that:
+
+| Shape | Sizing | Notes |
+|---|---|---|
+| One VM | **8 vCPU / 32 GB / 200 GB** | 16 GB would be tight enough to mislead. Clusters A and B share a host, so B needs an offset port scheme. |
+| Three VMs *(the stated direction)* | VM1 + VM2: **8 vCPU / 24 GB / 100 GB** each, one Doris cluster apiece. VM3: **4 vCPU / 8 GB** for the syncer, ingestion and control plane. | Each VM is smaller and easier to obtain; pinning one cluster per VM lets both use the documented default Doris ports. |
+
+- Host tuning Doris requires, **on every VM that runs a BE or FE**: `vm.max_map_count =
+  2000000` (this VM is at 1048576), swap off (already true), THP `madvise`, raised
+  file-handle limits, NTP (metadata clock skew must stay under 5000 ms — a real concern
+  across separate VMs, not one host).
+- Firewall/VPC rules between the VMs for the Doris port set — in particular BE↔BE
+  8040 and 8060, which CCR's full sync depends on.
 
 **Work**
-1. Resolve ADR-004 (Doris version) and ADR-005 (identity/pinning/ports/volumes).
+1. Resolve ADR-004 (Doris version) and ADR-005 (identity/pinning/ports/volumes). On a
+   multi-client cluster ADR-005 is load-bearing: pin each FE/BE to a named node with a
+   `constraint`, back it with a `host_volume`, and confirm a drained-and-restarted
+   allocation rejoins rather than re-registering as a new node.
 2. Job specs for cluster A and cluster B, each 1 FE + 1 BE, with `enable_feature_binlog=true`
    baked into `fe.conf` and `be.conf` from the start — CCR needs it on both clusters and
    turning it on later means a restart.
@@ -175,7 +215,7 @@ time.
 | Phase | Status | Blocker |
 |---|---|---|
 | 0 — Research | **Done** | — |
-| 1 — Nomad + Consul | Ready to build | ACL/TLS question above |
+| 1 — Nomad + Consul | Ready to build — topology settled (ADR-008), security deferred (ADR-009) | — |
 | 2 — Two Doris clusters | Designed at outline only | Larger VM; ADR-004, ADR-005 |
 | 3 — CCR | Outlined | Phase 2 |
 | 4 — Ingestion | Outlined | Phase 3 |
@@ -189,4 +229,7 @@ time.
 | CCR FE memory (≥4 GB heap per job, per cluster) | Medium | Size the Phase 2 host accordingly; cap `binlog.max_bytes` / `binlog.ttl_seconds` |
 | Syncer is a SPOF without a MySQL backend | Low for a POC | Accept; note it |
 | Nomad servers in containers are outside the image's stated purpose | Low | ADR-001a — go fully native if it misbehaves |
-| Doris `vm.max_map_count` requirement (2000000) | Low | Set it in Phase 2 host prep |
+| Doris `vm.max_map_count` requirement (2000000) | Low | Set it in Phase 2 host prep, on every Doris-hosting VM |
+| Phase 1 built single-host, then rewritten for 3 VMs | High | ADR-008 — decide the topology *before* writing `compose.yaml`; advertise host IPs from day one |
+| Scale-in kills a Doris BE without draining it | High | `ALTER SYSTEM DECOMMISSION BACKEND` and confirm empty first; never scale in the Raft server tier casually (ADR-008) |
+| Clock skew between VMs breaks Doris metadata | Medium | NTP on every VM; skew < 5000 ms |
