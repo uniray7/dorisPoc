@@ -1,0 +1,30 @@
+# Per-VM Nomad client values. Copy to node.hcl and edit; `make init` does this for you.
+#
+# doris_cluster is how a Doris job finds its home. The jobs in jobs/ constrain on it
+# rather than on a node name, so the job specs are identical regardless of what the
+# VMs are called.
+#
+# Invariant: exactly one Nomad client per doris_cluster value. The FE and BE of a
+# cluster are separate groups and must land on the same node — that co-location is
+# what makes ${attr.unique.network.ip-address} the correct address for both.
+#
+# Target layout across 3 VMs:
+#   vm1  doris_cluster = "a"       upstream Doris cluster
+#   vm2  doris_cluster = "b"       downstream Doris cluster
+#   vm3  doris_cluster = "none"    ccr-syncer and the ingestion pipeline
+
+name = "vm1"
+
+advertise {
+  http = "10.140.0.4"
+  rpc  = "10.140.0.4"
+  serf = "10.140.0.4"
+}
+
+client {
+  servers = ["10.140.0.4:4647"]
+
+  meta {
+    doris_cluster = "a"
+  }
+}

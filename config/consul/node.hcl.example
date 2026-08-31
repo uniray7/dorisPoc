@@ -1,0 +1,9 @@
+# Per-VM Consul values. Copy to node.hcl and edit; `make init` does this for you.
+#
+# Scaling out to 3 VMs: set bootstrap_expect = 3 on every VM and list all three
+# addresses in retry_join. Nothing else in this repo changes.
+
+node_name        = "vm1"
+advertise_addr   = "10.140.0.4"
+bootstrap_expect = 1
+retry_join       = []
