@@ -51,15 +51,21 @@ marks the latter with `[measured]`; keep that convention.
   `sg docker -c '<command>'` or `sudo docker`. Don't tell the user to re-login mid-task.
 - Passwordless `sudo` is available.
 - Docker 29.1.3; Docker Compose v2.40.3 (installed via `apt install docker-compose-v2`).
-- Host: AMD EPYC 7B12, **2 vCPU, 3.9 GB RAM, ~4.9 GB free disk**, AVX2 present, no swap.
+- Host: AMD EPYC 7B12, **2 vCPU, 7.8 GB RAM, ~19 GB free disk** (24 GB total), AVX2
+  present, no swap. *[re-measured 2026-08-31 — the VM was resized from 3.9 GB RAM /
+  4.9 GB free; the core count did not change.]*
 
-### This host cannot run Doris
+### This host still cannot run Doris
 
-Phase 1 (Nomad + Consul) fits fine. Phases 2–4 do not — the Doris FE+BE images alone are
-~4.4 GB compressed / ~8–10 GB unpacked against 4.9 GB free, and Doris's documented
-dev/test minimum is 8 cores + 24 GB **per cluster**. The user plans to scale the VM up
-before Phase 2. **Do not attempt to pull Doris images on this host** — it will fill the
-disk. If asked to start Phase 2, confirm the VM has actually been resized first.
+Phase 1 (Nomad + Consul) fits fine. Phases 2–4 do not. The 2026-08-31 resize (RAM
+3.9 → 7.8 GB, free disk 4.9 → 19 GB) removed the *disk* objection but not the real one:
+Doris's documented dev/test minimum is 8 cores + 8 GB (FE) and 8 cores + 16 GB (BE)
+**per cluster**, and the job specs ask for 24 GB on a 7.8 GB / 2 vCPU host. `make plan-a`
+still fails on `Dimension "memory" exhausted`, correctly.
+
+Pulling the images (~4.4 GB compressed, ~8–10 GB unpacked) would now fit in 19 GB free,
+so it is no longer the disk hazard it was — but don't pull speculatively, since nothing
+here can start them. If asked to begin Phase 2, check cores and RAM first, not disk.
 
 ## Architecture constraints that are easy to get wrong
 
@@ -112,8 +118,9 @@ bridge address.
 
 **Phase 2 job specs exist but have never been run.** `jobs/doris-cluster-{a,b}.nomad.hcl`
 validate and format clean, and `make plan-a` fails only on `Dimension "memory" exhausted`
-— correct on this host. **The Doris images are still not pulled and must not be**
-(~4.4 GiB compressed vs 4.6 GB free).
+— correct on this host, which offers 7.8 GB against the 24 GB the two tasks request.
+**The Doris images are still not pulled**; since the 2026-08-31 resize that is a matter of
+there being nothing to run them, not of free disk (19 GB).
 
 Decisions settled on 2026-08-28:
 - **ADR-008** — the multi-VM target is accepted, option A: one symmetric node stack per

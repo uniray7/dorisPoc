@@ -181,10 +181,11 @@ would collide — which is another reason the topology is one cluster per VM (AD
 
 **Not yet verified.** The job specs pass `nomad job validate` and `nomad fmt`, and
 `nomad job plan` reaches resource evaluation with the constraint satisfied — it fails
-only on `Dimension "memory" exhausted`, as it must on a 3.8 GB host. Nothing about
-Doris's *runtime* behaviour under rescheduling has been observed yet. The specific
-assumption most worth testing first is that appending to `fe.conf` / `be.conf` at
-container start overrides the shipped defaults (last-value-wins parsing).
+only on `Dimension "memory" exhausted`, as it must when the two tasks request 24 GB on
+a host with 7.8 GB *(re-checked 2026-08-31, after the VM was resized from 3.9 GB)*.
+Nothing about Doris's *runtime* behaviour under rescheduling has been observed yet.
+The specific assumption most worth testing first is that appending to `fe.conf` /
+`be.conf` at container start overrides the shipped defaults (last-value-wins parsing).
 
 **Original framing, retained:**
 

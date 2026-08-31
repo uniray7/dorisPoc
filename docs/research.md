@@ -374,13 +374,13 @@ tables (set by default on modern Doris).
 One FE + one BE image is ~4.4 GB compressed, roughly 8–10 GB unpacked. Both clusters can
 share the same two images.
 
-## 10. This host **[all measured]**
+## 10. This host **[all measured]** *(re-measured 2026-08-31)*
 
 | Property | Value |
 |---|---|
-| CPU | AMD EPYC 7B12, 2 vCPU, **AVX2 present** |
-| Memory | 3.9 GB total |
-| Disk free | 4.9 GB on `/` (8.7 GB total) |
+| CPU | AMD EPYC 7B12, 2 vCPU (1 core, 2 threads), **AVX2 present** — unchanged by the resize |
+| Memory | 7.8 GB total *(was 3.9 GB before 2026-08-31)* |
+| Disk free | 19 GB on `/` (24 GB total) *(was 4.9 GB free of 8.7 GB)* |
 | Swap | none (matches Doris requirement) |
 | `vm.max_map_count` | 1048576 — **below Doris's required 2000000** |
 | Docker | 29.1.3, daemon reachable |
@@ -388,9 +388,11 @@ share the same two images.
 | sudo | passwordless |
 | Network | github.com, registry-1.docker.io, releases.hashicorp.com all reachable |
 
-**Conclusion:** this host can run the Nomad + Consul control plane comfortably. It cannot
-run even one Doris cluster — the images alone exceed free disk, and Doris's own dev/test
-minimum is 8 cores / 24 GB for a single FE+BE pair.
+**Conclusion:** this host can run the Nomad + Consul control plane comfortably. It still
+cannot run even one Doris cluster: Doris's own dev/test minimum is 8 cores / 24 GB for a
+single FE+BE pair, against 2 vCPU / 7.8 GB here. The 2026-08-31 resize did lift the disk
+limit — the ~4.4 GB of images now fit in 19 GB free — so disk is no longer what blocks
+Phase 2; cores and RAM are.
 
 ---
 

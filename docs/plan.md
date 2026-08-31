@@ -26,10 +26,12 @@ Two findings from primary sources reshaped the approach. Full detail in
 
 Also worth knowing early:
 
-3. **This host cannot run Doris.** 2 vCPU / 3.9 GB RAM / 4.9 GB free disk. The Doris
-   FE+BE images alone are ~4.4 GB compressed (~8–10 GB unpacked), and Doris's own
-   *dev/test minimum* is 8 cores + 8 GB for FE and 8 cores + 16 GB for BE — per cluster.
-   Phase 1 fits comfortably; Phases 2–4 need a bigger machine.
+3. **This host cannot run Doris.** 2 vCPU / 7.8 GB RAM / 19 GB free disk *(re-measured
+   2026-08-31; it was 3.9 GB RAM / 4.9 GB free, and the core count did not change)*.
+   Doris's own *dev/test minimum* is 8 cores + 8 GB for FE and 8 cores + 16 GB for BE —
+   per cluster. The resize settles disk (the FE+BE images are ~4.4 GB compressed,
+   ~8–10 GB unpacked) but not cores or RAM. Phase 1 fits comfortably; Phases 2–4 still
+   need a bigger machine.
 4. **The target is not one VM.** This host will scale in and out, likely to **3 VMs in
    one Nomad cluster**, with both Doris clusters and the syncer scheduled across them.
    Phase 1 must therefore be built with host-routable advertise addresses and exposed
@@ -236,11 +238,14 @@ time.
 `jobs/doris-cluster-a.nomad.hcl` and `jobs/doris-cluster-b.nomad.hcl` exist, pass
 `nomad job validate` and `nomad fmt -check`, and `make plan-a` reaches resource
 evaluation with the placement constraint satisfied — failing only on
-`Dimension "memory" exhausted`, which is the correct answer on a 3.8 GB host.
+`Dimension "memory" exhausted` — the correct answer when the two tasks request 24 GB
+and the host has 7.8 GB.
 
-Nothing about Doris itself has been observed. The Doris images have deliberately **not**
-been pulled: `fe-3.0.7` + `be-3.0.7` is ~4.4 GiB compressed against 4.6 GB free disk, and
-pulling one cluster's pair would fill the disk. ADR-004 and ADR-005 are decided and
+Nothing about Doris itself has been observed. The Doris images have **not** been pulled.
+Until the 2026-08-31 resize that was a hard constraint — `fe-3.0.7` + `be-3.0.7` is
+~4.4 GiB compressed against the 4.6 GB free at the time, so a single pull would have
+filled the disk. There is now 19 GB free, so a pull would fit; it simply has no purpose
+while no Doris process can start here. ADR-004 and ADR-005 are decided and
 implemented, but they are decided *from the entrypoint source*, not from a running
 cluster.
 
