@@ -111,9 +111,20 @@ own identity, so the number of clients interacts with how Doris is pinned (ADR-0
 
 ---
 
-## ADR-004 — Doris version: target 3.0.x, decide at Phase 2
+## ADR-004 — Doris version: 3.0.7
 
-**Status:** Open — needs a decision before Phase 2
+**Status:** **Accepted (2026-08-28).** Pinned to `apache/doris:fe-3.0.7` /
+`apache/doris:be-3.0.7` in `jobs/`.
+
+**What settled it.** `selectdb/ccr-syncer` publishes no 3.x or 4.x git tag — its tags
+stop at `v2.1.3-rc02`, and the only 3.0-era build is the prebuilt
+`ccr-syncer-3.0.6-rc05-x64.tar.xz` from the Doris quickstart. The version rule is
+`syncer >= downstream >= upstream`, so **Doris 4.0/4.1 have no syncer at all** even
+though their images exist. That removes the newest lines from consideration and leaves
+2.1 versus 3.0; 3.0 wins on being current, and `fe-3.0.6` does not exist so the 3.0
+line pins at 3.0.7. The cost stands: some CCR docs must be read from the 2.1 pages.
+
+**Original reasoning, retained:**
 
 The tension:
 
@@ -131,11 +142,51 @@ line. Not decided yet.
 
 ---
 
-## ADR-005 — Doris identity under a scheduler (deferred, Phase 2)
+## ADR-005 — Doris identity under a scheduler
 
-**Status:** Open — and promoted in urgency by ADR-008: this must be resolved before a
-second Nomad client joins, not merely before Phase 2. With one client it is masked; with
-several it is the first thing to break.
+**Status:** **Accepted (2026-08-28)** and implemented in `jobs/doris-cluster-{a,b}.nomad.hcl`.
+Written but **not yet run against real Doris** — this host cannot start it (see below).
+
+**Decision.** Four mechanisms, together:
+
+1. **`network_mode = "host"`.** The container takes the VM's routable IP. That address
+   is stable across restarts, reachable from the other cluster's BEs for CCR, and is
+   what `SHOW BACKENDS` will report. No client-side permission is needed for this —
+   `allowed_modes` allowlists pid/ipc/userns/uts only, not networking (research.md §12).
+2. **Static ports, not Nomad's dynamic 20000–32000 range.** FE 8030/9020/9030/9010 and
+   BE 9060/8040/9050/8060, declared `static` in the group `network` block so Nomad
+   reserves them and refuses a conflicting placement.
+3. **Host volumes for identity.** `doris-fe-meta` → `/opt/apache-doris/fe/doris-meta`
+   and `doris-be-storage` → `/opt/apache-doris/be/storage`. The official entrypoints
+   skip registration entirely when those directories are already populated, so a
+   restart rejoins instead of re-registering. Losing a volume is what corrupts
+   membership.
+4. **Pinned by client meta, not by node name.** Each VM declares
+   `meta { doris_cluster = "a" | "b" | "none" }`; the jobs carry
+   `constraint { attribute = "${meta.doris_cluster}" ... }`. The job files are
+   therefore identical regardless of what the VMs are called.
+   **Invariant: exactly one Nomad client per `doris_cluster` value.** The FE and BE are
+   separate groups and each interpolates `${attr.unique.network.ip-address}` as the
+   cluster address, which is only correct while they land on the same node.
+
+**FQDN mode is rejected, and not by choice.** The official FE image validates
+`FE_SERVERS` against a regex that accepts literal IPv4 only and rejects hostnames
+(research.md §11). Doris FQDN mode cannot be driven through this entrypoint, so stable
+identity has to come from pinning plus host networking instead. Reaching FQDN mode would
+mean bypassing the entrypoint, which is a larger change than the POC needs.
+
+**Ports across VMs.** With one Doris cluster pinned per VM, clusters A and B both use
+the documented default ports and no offset scheme is needed. Two clusters on one VM
+would collide — which is another reason the topology is one cluster per VM (ADR-008).
+
+**Not yet verified.** The job specs pass `nomad job validate` and `nomad fmt`, and
+`nomad job plan` reaches resource evaluation with the constraint satisfied — it fails
+only on `Dimension "memory" exhausted`, as it must on a 3.8 GB host. Nothing about
+Doris's *runtime* behaviour under rescheduling has been observed yet. The specific
+assumption most worth testing first is that appending to `fe.conf` / `be.conf` at
+container start overrides the shipped defaults (last-value-wins parsing).
+
+**Original framing, retained:**
 
 Doris is not a stateless workload. FE and BE persist their own network identity into
 metadata, and BEs are registered with the FE by address. Under a scheduler that can

@@ -161,9 +161,11 @@ Two ways to meet that:
    multi-client cluster ADR-005 is load-bearing: pin each FE/BE to a named node with a
    `constraint`, back it with a `host_volume`, and confirm a drained-and-restarted
    allocation rejoins rather than re-registering as a new node.
-2. Job specs for cluster A and cluster B, each 1 FE + 1 BE, with `enable_feature_binlog=true`
-   baked into `fe.conf` and `be.conf` from the start — CCR needs it on both clusters and
-   turning it on later means a restart.
+2. ~~Job specs for cluster A and cluster B~~ — **done**, see `jobs/`. Each is 1 FE + 1 BE
+   with `enable_feature_binlog=true` appended to `fe.conf` and `be.conf` at container
+   start, host networking, static ports, host volumes for identity, and placement by
+   `meta.doris_cluster`. The FE/BE container contract they target is documented in
+   `research.md` §11.
 3. FE tuning for CCR: `max_backup_restore_job_num_per_db = 2`,
    `ignore_backup_tmp_partitions = true`, `enable_restore_snapshot_rpc_compression = true`.
    BE tuning: `thrift_max_message_size = 2000000000`.
@@ -173,6 +175,15 @@ Two ways to meet that:
 
 **Exit criteria:** both clusters independently healthy; `show backends` reports alive BEs
 with addresses the other cluster can actually reach.
+
+**First things to check when a real VM exists**, in order:
+1. `make plan-a` places instead of exhausting memory.
+2. The FE comes up and `SHOW FRONTENDS` reports the VM's routable IP — not `172.x`.
+3. The appended `fe.conf` settings actually took effect:
+   `ADMIN SHOW FRONTEND CONFIG LIKE "enable_feature_binlog"`. This is the assumption in
+   the job specs least supported by documentation.
+4. Restart the FE allocation and confirm it rejoins from `doris-meta` rather than
+   re-registering — the whole of ADR-005 rests on this.
 
 ---
 
@@ -215,10 +226,23 @@ time.
 | Phase | Status | Blocker |
 |---|---|---|
 | 0 — Research | **Done** | — |
-| 1 — Nomad + Consul | Ready to build — topology settled (ADR-008), security deferred (ADR-009) | — |
-| 2 — Two Doris clusters | Designed at outline only | Larger VM; ADR-004, ADR-005 |
+| 1 — Nomad + Consul | **Done and verified on this VM** (2026-08-28) — `make verify` passes every exit criterion | — |
+| 2 — Two Doris clusters | **Job specs written and validated; never run** | A VM that can actually run Doris |
 | 3 — CCR | Outlined | Phase 2 |
 | 4 — Ingestion | Outlined | Phase 3 |
+
+### What "Phase 2 written but not run" means
+
+`jobs/doris-cluster-a.nomad.hcl` and `jobs/doris-cluster-b.nomad.hcl` exist, pass
+`nomad job validate` and `nomad fmt -check`, and `make plan-a` reaches resource
+evaluation with the placement constraint satisfied — failing only on
+`Dimension "memory" exhausted`, which is the correct answer on a 3.8 GB host.
+
+Nothing about Doris itself has been observed. The Doris images have deliberately **not**
+been pulled: `fe-3.0.7` + `be-3.0.7` is ~4.4 GiB compressed against 4.6 GB free disk, and
+pulling one cluster's pair would fill the disk. ADR-004 and ADR-005 are decided and
+implemented, but they are decided *from the entrypoint source*, not from a running
+cluster.
 
 ## Risks
 

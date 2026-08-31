@@ -80,8 +80,10 @@ disk. If asked to start Phase 2, confirm the VM has actually been resized first.
 5. **`enable_feature_binlog=true` must be in both `fe.conf` and `be.conf` on both
    clusters**, ideally from first boot — enabling it later requires a restart.
 6. **Nomad 2.0.4+ enforces `allowed_modes` / `allow_privileged`** (CVE-2026-14891) before a
-   task may set host namespace modes. If a Doris job needs `network_mode = "host"`, the
-   client's `plugin "docker"` block must permit it.
+   task may set host namespace modes — that means `pid`, `ipc`, `userns`, `uts`.
+   It does **not** cover `network_mode`: a task may set `network_mode = "host"` with no
+   client-side allowlist. `volumes { enabled = true }` is still needed for alloc-dir bind
+   mounts. (Corrected 2026-08-28; see research.md §12.)
 7. **The target is 3 VMs, not one.** Everything must advertise the VM's routable IP
    (Consul `advertise_addr`, Nomad `advertise {}`) and expose its ports on the host —
    never a Docker bridge address. The cluster is one symmetric node stack per VM; scaling
@@ -103,14 +105,32 @@ disk. If asked to start Phase 2, confirm the VM has actually been resized first.
 
 ## Current status
 
-Phase 0 (research) is complete. Phase 1 is **designed and unblocked but not yet built** —
-no `compose.yaml` or configs exist yet.
+**Phase 1 is built and verified on this VM** (2026-08-28). `make verify` passes: Consul
+and Nomad leaders elected, native Nomad client ready with a healthy docker driver, four
+Doris host volumes registered, `meta.doris_cluster = a`, and no agent advertising a
+bridge address.
 
-Two decisions were settled on 2026-08-28:
+**Phase 2 job specs exist but have never been run.** `jobs/doris-cluster-{a,b}.nomad.hcl`
+validate and format clean, and `make plan-a` fails only on `Dimension "memory" exhausted`
+— correct on this host. **The Doris images are still not pulled and must not be**
+(~4.4 GiB compressed vs 4.6 GB free).
+
+Decisions settled on 2026-08-28:
 - **ADR-008** — the multi-VM target is accepted, option A: one symmetric node stack per
   VM (Consul server + Nomad server in Compose on host networking, Nomad client native).
   ADR-003's 3+3-on-one-host shape is superseded.
 - **ADR-009** — no ACLs or gossip encryption in Phase 1; deferred to a hardening pass.
+- **ADR-004** — Doris **3.0.7**. Forced by ccr-syncer: it has no 3.x/4.x git tags, so
+  Doris 4.x has no syncer at all.
+- **ADR-005** — identity via host networking + static ports + host volumes + placement
+  by `meta.doris_cluster`. Doris FQDN mode is *not* usable: the official FE image
+  validates `FE_SERVERS` against an IPv4-only regex.
 
-Still open: ADR-004 (Doris version) and ADR-005 (identity under a scheduler — now urgent,
-since it must be settled before a second Nomad client joins).
+Nothing is still open. The next step needs a bigger VM, not another decision.
+
+## Working on the Doris jobs
+
+`docs/research.md` §11 documents the official FE/BE container contract — the entrypoint
+env vars, the modes, the volume paths, the IPv4-only regex — read from
+`apache/doris` `docker/runtime/`. It is not on the Doris website. Check there before
+reading the entrypoint scripts again.
