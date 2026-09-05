@@ -374,13 +374,13 @@ tables (set by default on modern Doris).
 One FE + one BE image is ~4.4 GB compressed, roughly 8–10 GB unpacked. Both clusters can
 share the same two images.
 
-## 10. This host **[all measured]**
+## 10. This host **[all measured]** *(re-measured 2026-08-31)*
 
 | Property | Value |
 |---|---|
-| CPU | AMD EPYC 7B12, 2 vCPU, **AVX2 present** |
-| Memory | 3.9 GB total |
-| Disk free | 4.9 GB on `/` (8.7 GB total) |
+| CPU | AMD EPYC 7B12, 2 vCPU (1 core, 2 threads), **AVX2 present** — unchanged by the resize |
+| Memory | 7.8 GB total *(was 3.9 GB before 2026-08-31)* |
+| Disk free | 19 GB on `/` (24 GB total) *(was 4.9 GB free of 8.7 GB)* |
 | Swap | none (matches Doris requirement) |
 | `vm.max_map_count` | 1048576 — **below Doris's required 2000000** |
 | Docker | 29.1.3, daemon reachable |
@@ -388,6 +388,122 @@ share the same two images.
 | sudo | passwordless |
 | Network | github.com, registry-1.docker.io, releases.hashicorp.com all reachable |
 
-**Conclusion:** this host can run the Nomad + Consul control plane comfortably. It cannot
-run even one Doris cluster — the images alone exceed free disk, and Doris's own dev/test
-minimum is 8 cores / 24 GB for a single FE+BE pair.
+**Conclusion:** this host can run the Nomad + Consul control plane comfortably. It still
+cannot run even one Doris cluster: Doris's own dev/test minimum is 8 cores / 24 GB for a
+single FE+BE pair, against 2 vCPU / 7.8 GB here. The 2026-08-31 resize did lift the disk
+limit — the ~4.4 GB of images now fit in 19 GB free — so disk is no longer what blocks
+Phase 2; cores and RAM are.
+
+---
+
+## 11. Doris official container contract **(re-checked 2026-08-28)**
+
+Source: [`apache/doris`](https://github.com/apache/doris) `docker/runtime/` — the
+Dockerfiles and entrypoint scripts that build the published images. This is the
+authoritative contract; it is not documented on the website.
+
+### Images
+
+Official tags are `apache/doris:fe-<version>` and `apache/doris:be-<version>`
+(also `ms-` for 3.0+ storage/compute separation, and `broker-`). Verified present:
+`fe-2.1.11`, `fe-3.0.7`, `fe-4.0.8`, `fe-4.1.3` and the matching `be-` tags.
+`fe-3.0.6` does **not** exist (the 3.0 line jumped to 3.0.7).
+
+**[measured, Docker Hub registry API, amd64, 2026-08-28]**
+
+| Image | Compressed | Layers |
+|---|---|---|
+| `apache/doris:fe-3.0.7` | 1.43 GiB | 10 |
+| `apache/doris:be-3.0.7` | 2.93 GiB | 11 |
+
+One FE+BE pair is ~4.4 GiB compressed; two clusters is ~8.7 GiB before unpacking.
+
+### FE — `ENTRYPOINT ["bash","init_fe.sh"]` (`/usr/local/bin/init_fe.sh`)
+
+Four mutually exclusive modes, selected by which variables are set:
+
+| Mode | Trigger | Variables |
+|---|---|---|
+| ELECTION | `FE_SERVERS` + `FE_ID` | `FE_SERVERS="fe1:IP:9010[,fe2:IP:9010...]"`, `FE_ID` 1–9 |
+| ASSIGN | the four below | `FE_MASTER_IP`, `FE_MASTER_PORT`, `FE_CURRENT_IP`, `FE_CURRENT_PORT` |
+| K8S | `BUILD_TYPE=k8s` | uses the operator's `fe_entrypoint.sh` path instead |
+| RECOVERY | `RECOVERY=true` | starts `start_fe.sh --metadata_failure_recovery` |
+
+Constraints that are easy to trip over, all enforced by the script:
+
+- **`FE_SERVERS` requires literal IPv4 addresses.** The validating regex is
+  `^.+:[1-2]?[0-9]?[0-9](\.[1-2]?[0-9]?[0-9]){3}:[1-6]?[0-9]{1,4}(,...)*$`. Hostnames
+  and FQDNs are rejected. **Doris FQDN mode is therefore not reachable through this
+  entrypoint** — a significant input to ADR-005.
+- The per-node name must be literally `fe${FE_ID}`; anything else fails with
+  "Could not find configuration for fe*N* in FE_SERVERS".
+- `FE_ID = 1` is the master. It starts `start_fe.sh --console`; every other ID starts
+  with `--helper <master_ip>:<master_port>` and first registers itself by running
+  `ALTER SYSTEM ADD FOLLOWER` over MySQL as `root` with no password on port 9030.
+- `priority_networks` is computed as the **/24 containing the node's own IP** and
+  appended to `fe.conf`, but only on first initialisation.
+- Metadata lives at **`/opt/apache-doris/fe/doris-meta`**. If `doris-meta/image` exists
+  and is non-empty the script skips initialisation and registration entirely and just
+  starts the FE. *This is the mechanism that makes a restart safe — and that makes a
+  lost volume silently corrupt cluster membership.*
+
+### BE — `ENTRYPOINT ["bash","entry_point.sh"]` (`/usr/local/bin/entry_point.sh`)
+
+| Mode | Variables |
+|---|---|
+| ELECTION | `FE_SERVERS` (master FE is parsed from the **first** entry) + `BE_ADDR="IP:9050"` |
+| ASSIGN | `FE_MASTER_IP`, `BE_IP`, `BE_PORT` |
+
+- `BE_ADDR` carries the **heartbeat port (9050)** — the address `SHOW BACKENDS`
+  reports, and therefore the address the other cluster's BEs must reach for CCR.
+- Registers itself with `ALTER SYSTEM ADD BACKEND '<BE_ADDR>'` over MySQL as `root`,
+  no password, against the master FE on 9030, retrying for 60 s.
+- `priority_networks` is again derived as the /24 of the BE's own IP.
+- Storage lives at **`/opt/apache-doris/be/storage`**. If `storage/data` exists, the
+  script skips initialisation and registration — same identity-preserving mechanism
+  as the FE.
+- The entrypoint exports `SKIP_CHECK_ULIMIT=true`, so a containerised BE does not
+  fail the file-handle preflight.
+- Files placed in **`/docker-entrypoint-initdb.d`** (`.sql` or `.sql.gz`) are piped
+  into the master FE after the BE registers — a convenient hook for creating the CCR
+  sync user and enabling binlog on a database.
+
+### Default heap
+
+`conf/fe.conf` on `branch-3.0` already ships `JAVA_OPTS_FOR_JDK_17="... -Xmx8192m
+-Xms8192m ..."`. That covers the documented "≥ 4 GB FE heap per CCR job" for a small
+number of jobs without overriding `JAVA_OPTS`.
+
+## 12. Corrections to earlier findings **(2026-08-28)**
+
+### `allowed_modes` does not gate `network_mode`
+
+Source: [Docker task driver](https://developer.hashicorp.com/nomad/docs/deploy/task-driver/docker)
+
+The client's `plugin "docker"` `allowed_modes` block allowlists the **`pid`, `ipc`,
+`userns` and `uts`** namespaces only. There is **no network-mode allowlist**, and a task
+setting `network_mode = "host"` needs no client-side permission. CVE-2026-14891's
+enforcement applies to host *namespace* modes in that list, not to host networking.
+`volumes { enabled = true }` is still required for bind-mounting out of the alloc dir.
+
+### `hashicorp/consul` cannot take a read-only config mount **[measured]**
+
+The image entrypoint `chown`s `/consul/config` on start and exits if it cannot. Mount
+the config directory read-write.
+
+### A containerised Nomad server and a native Nomad client collide on one host **[measured]**
+
+With the Nomad server container on `network_mode: host`, it owns 4646/4647. The native
+Nomad client then fails to start with
+`failed to start HTTP listener: listen tcp 0.0.0.0:4646: bind: address already in use`.
+Two Nomad agents on one VM need distinct ports; this repo gives the client
+`ports { http = 4656, rpc = 4657 }`. ADR-001a (a single native server+client agent)
+remains the alternative that removes the collision entirely.
+
+### `ccr-syncer` release tags stop at 2.1
+
+`github.com/selectdb/ccr-syncer` git tags top out at **`v2.1.3-rc02`**; there are no
+3.x or 4.x tags and no GitHub releases. The only 3.0-era syncer is the prebuilt
+`ccr-syncer-3.0.6-rc05-x64.tar.xz` linked from the Doris quickstart. Since the version
+rule is `syncer >= downstream >= upstream`, **there is no syncer for Doris 4.x** — which
+settles ADR-004 in favour of the 3.0 line.

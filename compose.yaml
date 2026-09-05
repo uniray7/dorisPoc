@@ -1,0 +1,51 @@
+# One node stack, replicated per VM (ADR-008 option A).
+#
+# Both services use the host network namespace deliberately: agents must advertise the
+# VM's routable address so a second and third VM can reach them. A Docker bridge
+# address here is the single mistake that turns scale-out into a rewrite.
+#
+# The Nomad *client* is not here — it runs natively under systemd (ADR-001).
+# See scripts/install-client.sh.
+
+name: dorispoc
+
+services:
+  consul-server:
+    image: hashicorp/consul:2.0.3
+    container_name: consul-server
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - agent
+      - -server
+      - -config-dir=/consul/config
+    volumes:
+      # Not :ro — the image entrypoint chowns /consul/config on start.
+      - ./config/consul:/consul/config
+      - consul-data:/consul/data
+    healthcheck:
+      test: ["CMD", "consul", "members"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  nomad-server:
+    image: hashicorp/nomad:2.0.5
+    container_name: nomad-server
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - agent
+      - -config=/nomad/config/server.hcl
+      - -config=/nomad/config/node.hcl
+    volumes:
+      - ./config/nomad/server:/nomad/config:ro
+      - nomad-data:/nomad/data
+    depends_on:
+      consul-server:
+        condition: service_healthy
+
+volumes:
+  consul-data:
+  nomad-data:
